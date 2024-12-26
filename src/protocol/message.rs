@@ -41,9 +41,9 @@ where
     // Standardized order of processing flags: Compression -> Encoding -> Encryption
     fn ordered_flags() -> Vec<Flags> {
         vec![
+            Flags::ENCRYPTED,
             Flags::COMPRESSED,
             Flags::ENCODED,
-            Flags::ENCRYPTED,
             Flags::SIGNATURE,
         ]
     }
@@ -63,9 +63,9 @@ where
         for flag in Self::ordered_flags() {
             if flags.contains(flag.clone()) {
                 payload_bytes = match flag {
+                    Flags::ENCRYPTED => encrypt_with_aes_gcm(&payload_bytes, &encryption_key)?,
                     Flags::COMPRESSED => compress_data(&payload_bytes)?,
                     Flags::ENCODED => encode_data(&payload_bytes),
-                    Flags::ENCRYPTED => encrypt_with_aes_gcm(&payload_bytes, &encryption_key)?,
                     Flags::SIGNATURE => generate_checksum(&mut payload_bytes),
                     _ => payload_bytes,
                 };
@@ -161,11 +161,10 @@ where
         for flag in Self::ordered_flags().iter().rev().cloned() {
             if flags.contains(flag) {
                 payload = match flag {
-                    Flags::ENCRYPTED => decrypt_with_aes_gcm(&payload, &encryption_key)?,
+                    Flags::SIGNATURE => verify_checksum(payload),
                     Flags::ENCODED => decode_data(&payload).unwrap(),
                     Flags::COMPRESSED => decompress_data(&payload)?,
-                    Flags::SIGNATURE => verify_checksum(payload),
-                    Flags::NONE => payload,
+                    Flags::ENCRYPTED => decrypt_with_aes_gcm(&payload, &encryption_key)?,
                     _ => payload,
                 };
             }
