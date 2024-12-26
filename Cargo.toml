@@ -2,6 +2,13 @@
 name = "simple_comms"
 version = "1.0.0"
 edition = "2021"
+authors = [
+    "Artisan Hosting",
+    "Darrion Whitfield <dwhitfield@ramfield.net>"
+]
+description = "Rust implementation of a communication protocol for AH"
+homepage = "https://docs.artisanhosting.net"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 aes-gcm = "0.10.3"
