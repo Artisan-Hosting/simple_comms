@@ -32,7 +32,7 @@ where
 
     // Creating message bytes and appending eol
     let mut serialized_message: Vec<u8> = message.to_bytes().await?;
-    serialized_message.extend(EOL.as_bytes());
+    serialized_message.extend(EOL);
 
     log!(LogLevel::Trace, "message serialized for sending");
 
@@ -50,7 +50,7 @@ where
 
     // Sleep a second for unix socket issues
     // tokio::time::sleep(Duration::from_micros(500)).await;
-    match read_until(&mut stream, EOL.as_bytes().to_vec()).await {
+    match read_until(&mut stream, EOL.to_vec()).await {
         Ok(response_buffer) => {
             if response_buffer.is_empty() {
                 log!(LogLevel::Error, "Received empty response data");
@@ -126,7 +126,7 @@ where
     STREAM: AsyncReadExt + AsyncWriteExt + Unpin,
     RESPONSE: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Display,
 {
-    let mut buffer: Vec<u8> = read_until(stream, EOL.as_bytes().to_vec()).await?;
+    let mut buffer: Vec<u8> = read_until(stream, EOL.to_vec()).await?;
 
     if proto == Proto::TCP {
         stream.flush().await?;
@@ -134,7 +134,7 @@ where
 
     if let Some(pos) = buffer
         .windows(EOL.len())
-        .rposition(|window| window == EOL.as_bytes())
+        .rposition(|window| window == EOL)
     {
         buffer.truncate(pos);
     }
@@ -164,7 +164,7 @@ pub async fn create_response(status: ProtocolStatus) -> Result<Vec<u8>, io::Erro
     let mut message: ProtocolMessage<()> = ProtocolMessage::new(Flags::NONE, ())?;
     message.header.status = status.bits();
     let mut message_bytes = message.to_bytes().await?;
-    message_bytes.extend_from_slice(EOL.as_bytes());
+    message_bytes.extend_from_slice(EOL);
     return Ok(message_bytes);
 }
 

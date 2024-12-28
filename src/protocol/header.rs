@@ -93,4 +93,4 @@ pub const HEADER_LENGTH: usize = HEADER_VERSION_LEN
     + HEADER_ORIGIN_ADDRESS_LEN
     + HEADER_ENCRYPTION_KEY_LEN;
 
-pub const EOL: &str = "-EOL-";
+pub const EOL: &[u8] = b"-EOL-";

@@ -192,7 +192,7 @@ where
     pub async fn format(self) -> Result<Vec<u8>, io::Error> {
         let mut message: ProtocolMessage<T> = self;
         let mut message_bytes: Vec<u8> = message.to_bytes().await?;
-        message_bytes.extend_from_slice(EOL.as_bytes());
+        message_bytes.extend_from_slice(EOL);
         return Ok(message_bytes);
     }
 }
