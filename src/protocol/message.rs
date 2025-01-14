@@ -1,10 +1,19 @@
 use std::io::{self, Cursor};
 
-use crate::{network::utils::{get_header_version, get_local_ip}, protocol::{checksum::{generate_checksum, verify_checksum}, compression::{compress_data, decompress_data}, encode::{decode_data, encode_data}, encryption::{decrypt_with_aes_gcm, encrypt_with_aes_gcm, generate_key}, flags::Flags, header::HEADER_LENGTH, io_helpers::read_with_std_io, status::ProtocolStatus}};
+use crate::{
+    network::utils::{get_header_version, get_local_ip},
+    protocol::{
+        checksum::{generate_checksum, verify_checksum}, compression::{compress_data, decompress_data}, encode::{decode_data, encode_data}, encryption::{decrypt_with_aes_gcm, encrypt_with_aes_gcm, generate_key}, flags::Flags, header::HEADER_LENGTH, io_helpers::read_with_std_io, padding::{add_padding_with_scheme, remove_padding_with_scheme, x_padding, x_trim_validation}, status::ProtocolStatus
+    },
+    RELEASEINFO,
+};
 
-use super::{header::{ProtocolHeader, EOL}, reserved::Reserved};
-use dusa_collection_utils::log;
+use super::{
+    header::{ProtocolHeader, EOL},
+    reserved::Reserved,
+};
 use dusa_collection_utils::log::LogLevel;
+use dusa_collection_utils::{log, version::Version};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,9 +61,11 @@ where
         log!(LogLevel::Trace, "Starting to_bytes conversion.");
 
         // Serialize and process payload
-        let mut payload_bytes = bincode::serialize(&self.payload)
+        let payload_bytes_unpadded = bincode::serialize(&self.payload)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
+        let mut payload_bytes: Vec<u8> = add_padding_with_scheme(&payload_bytes_unpadded, 40, x_padding);
+    
         // Generate a random key for AES-GCM encryption
         let mut encryption_key: [u8; 32] = [0u8; 32];
         generate_key(&mut encryption_key);
@@ -120,6 +131,22 @@ where
         read_with_std_io(&mut cursor, &mut version_bytes)?;
         let version = u16::from_be_bytes(version_bytes);
 
+        // Check and reject version data
+        let incomming_version = Version::decode(version);
+        let current_version = Version::new(env!("CARGO_PKG_VERSION"), RELEASEINFO);
+        if !current_version.compare_versions(&incomming_version) {
+            log!(
+                LogLevel::Warn,
+                "Message dropped, Outdated version. Required: {}, Recieved: {}",
+                current_version,
+                incomming_version
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Out of date message recieved",
+            ));
+        }
+
         let mut flags_bytes: [u8; 1] = [0u8; 1];
         read_with_std_io(&mut cursor, &mut flags_bytes)?;
         let flags = u8::from_be_bytes(flags_bytes);
@@ -155,8 +182,8 @@ where
         };
         log!(LogLevel::Debug, "Recieved header \n{}", header);
 
-        // Deserialize and process payload
         let mut payload = payload_bytes.to_vec();
+
         let flags = Flags::from_bits_truncate(header.flags);
         for flag in Self::ordered_flags().iter().rev().cloned() {
             if flags.contains(flag) {
@@ -169,6 +196,15 @@ where
                 };
             }
         }
+
+        // Deserialize and process payload
+        payload = match remove_padding_with_scheme(&payload, 32, x_trim_validation) {
+            Ok(payload) => payload,
+            Err(e) => {
+                log!(LogLevel::Debug, "Failed to de-pad data: {}", e);
+                payload_bytes.to_vec()
+            }
+        };
 
         let payload: T = bincode::deserialize(&payload).map_err(|err| {
             io::Error::new(

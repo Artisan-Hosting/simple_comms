@@ -1,6 +1,6 @@
 [package]
 name = "simple_comms"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 authors = [
     "Artisan Hosting",
@@ -15,7 +15,7 @@ aes-gcm = "0.10.3"
 bincode = "1.3.3"
 bitflags = "2.6.0"
 colored = "2.2.0"
-dusa_collection_utils = "3.1.1"
+dusa_collection_utils = "3.1.3"
 flate2 = "1.0.35"
 get_if_addrs = "0.5.3"
 hex = "0.4.3"
