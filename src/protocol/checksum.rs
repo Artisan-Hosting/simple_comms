@@ -12,7 +12,7 @@ pub fn generate_checksum(data: &mut Vec<u8>) -> Vec<u8> {
 pub fn verify_checksum(data_with_checksum: Vec<u8>) -> Vec<u8> {
     // Check that the data has at least a SHA-256 checksum length appended
     if data_with_checksum.len() < 32 {
-        return Vec::new();
+        panic!("checksum data too small")
     }
 
     // Separate the data and the appended checksum
@@ -28,6 +28,6 @@ pub fn verify_checksum(data_with_checksum: Vec<u8>) -> Vec<u8> {
     if checksum == calculated_checksum.as_slice() {
         data.to_vec() // Return original data if checksum is valid
     } else {
-        Vec::new() // Return an empty Vec<u8> if checksum is invalid
+        panic!("checksum invalid")
     }
 }
