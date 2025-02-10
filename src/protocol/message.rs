@@ -3,7 +3,17 @@ use std::io::{self, Cursor};
 use crate::{
     network::utils::{get_header_version, get_local_ip},
     protocol::{
-        checksum::{generate_checksum, verify_checksum}, compression::{compress_data, decompress_data}, encode::{decode_data, encode_data}, encryption::{decrypt_with_aes_gcm, encrypt_with_aes_gcm, generate_key}, flags::Flags, header::HEADER_LENGTH, io_helpers::read_with_std_io, padding::{add_padding_with_scheme, remove_padding_with_scheme, x_padding, x_trim_validation}, status::ProtocolStatus
+        checksum::{generate_checksum, verify_checksum},
+        compression::{compress_data, decompress_data},
+        encode::{decode_data, encode_data},
+        encryption::{decrypt_with_aes_gcm, encrypt_with_aes_gcm, generate_key},
+        flags::Flags,
+        header::HEADER_LENGTH,
+        io_helpers::read_with_std_io,
+        padding::{
+            add_padding_with_scheme, pkcs7_padding, pkcs7_validation, remove_padding_with_scheme,
+        },
+        status::ProtocolStatus,
     },
     RELEASEINFO,
 };
@@ -64,8 +74,9 @@ where
         let payload_bytes_unpadded = bincode::serialize(&self.payload)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
-        let mut payload_bytes: Vec<u8> = add_padding_with_scheme(&payload_bytes_unpadded, 40, x_padding);
-    
+        let mut payload_bytes: Vec<u8> =
+            add_padding_with_scheme(&payload_bytes_unpadded, 16, pkcs7_padding);
+
         // Generate a random key for AES-GCM encryption
         let mut encryption_key: [u8; 32] = [0u8; 32];
         generate_key(&mut encryption_key);
@@ -198,7 +209,7 @@ where
         }
 
         // Deserialize and process payload
-        payload = match remove_padding_with_scheme(&payload, 32, x_trim_validation) {
+        payload = match remove_padding_with_scheme(&payload, 16, pkcs7_validation) {
             Ok(payload) => payload,
             Err(e) => {
                 log!(LogLevel::Debug, "Failed to de-pad data: {}", e);
@@ -209,7 +220,7 @@ where
         let payload: T = bincode::deserialize(&payload).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Payload error: {}", err),
+                format!("Payload error from bytes: {}", err),
             )
         })?;
 
