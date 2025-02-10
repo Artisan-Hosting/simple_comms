@@ -6,7 +6,7 @@ pub mod flags;
 pub mod header;
 pub mod io_helpers;
 pub mod message;
+pub mod padding;
 pub mod proto;
 pub mod reserved;
 pub mod status;
-pub mod padding;

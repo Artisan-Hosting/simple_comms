@@ -12,7 +12,7 @@ use super::{
     header::{ProtocolHeader, EOL},
     reserved::Reserved,
 };
-use dusa_collection_utils::log::LogLevel;
+use dusa_collection_utils::logger::LogLevel;
 use dusa_collection_utils::{log, version::Version};
 use serde::{Deserialize, Serialize};
 

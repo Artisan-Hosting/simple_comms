@@ -11,7 +11,11 @@ where
     padded_data
 }
 
-pub fn remove_padding_with_scheme<F>(padded_data: &[u8], block_size: usize, validate_fn: F) -> Result<Vec<u8>, String>
+pub fn remove_padding_with_scheme<F>(
+    padded_data: &[u8],
+    block_size: usize,
+    validate_fn: F,
+) -> Result<Vec<u8>, String>
 where
     F: Fn(&[u8]) -> Result<usize, String>,
 {
@@ -40,7 +44,10 @@ pub fn pkcs7_validation(padded: &[u8]) -> Result<usize, String> {
         return Err("Invalid padding length".to_string());
     }
 
-    if !padded[padded.len() - padding_len..].iter().all(|&byte| byte as usize == padding_len) {
+    if !padded[padded.len() - padding_len..]
+        .iter()
+        .all(|&byte| byte as usize == padding_len)
+    {
         return Err("Invalid padding bytes".to_string());
     }
 

@@ -295,9 +295,9 @@ dependencies = [
 
 [[package]]
 name = "dusa_collection_utils"
-version = "3.1.3"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e6c6599898e8e29b39266982d289a95168c4f31bbb8bf6907f8dc7a0581c445"
+checksum = "8db199a091f9d35836222a2e3487d1dd2f65b33dd22b65547f1bbc6c8ffbded6"
 dependencies = [
  "block-modes",
  "cfg_rust_features",

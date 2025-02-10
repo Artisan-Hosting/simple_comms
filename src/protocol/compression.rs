@@ -1,5 +1,4 @@
 use std::io::{self, Read, Write};
-
 use flate2::{bufread::GzDecoder, write::GzEncoder, Compression};
 
 pub fn compress_data(data: &[u8]) -> io::Result<Vec<u8>> {

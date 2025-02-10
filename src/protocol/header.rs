@@ -1,5 +1,5 @@
 use colored::Colorize;
-use dusa_collection_utils::stringy::Stringy;
+use dusa_collection_utils::types::stringy::Stringy;
 use dusa_collection_utils::version::Version;
 use serde::{Deserialize, Serialize};
 use std::fmt;
