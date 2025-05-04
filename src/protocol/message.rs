@@ -83,16 +83,16 @@ where
 
         let flags = Flags::from_bits_truncate(self.header.flags);
         for flag in Self::ordered_flags() {
-            if flags.contains(flag.clone()) {
+            if flags.contains(flag) {
                 payload_bytes = match flag {
-                    Flags::ENCRYPTED => encrypt_with_aes_gcm(&payload_bytes, &encryption_key)?,
                     Flags::COMPRESSED => compress_data(&payload_bytes)?,
                     Flags::ENCODED => encode_data(&payload_bytes),
+                    Flags::ENCRYPTED => encrypt_with_aes_gcm(&payload_bytes, &encryption_key)?,
                     Flags::SIGNATURE => generate_checksum(&mut payload_bytes),
                     _ => payload_bytes,
                 };
             }
-        }
+        }        
 
         // Set payload length after transformations
         self.header.payload_length = payload_bytes.len() as u64;
@@ -196,13 +196,13 @@ where
         let mut payload = payload_bytes.to_vec();
 
         let flags = Flags::from_bits_truncate(header.flags);
-        for flag in Self::ordered_flags().iter().rev().cloned() {
-            if flags.contains(flag) {
-                payload = match flag {
+        for flag in Self::ordered_flags().iter().rev() {
+            if flags.contains(*flag) {
+                payload = match *flag {
                     Flags::SIGNATURE => verify_checksum(payload),
+                    Flags::ENCRYPTED => decrypt_with_aes_gcm(&payload, &encryption_key)?,
                     Flags::ENCODED => decode_data(&payload).unwrap(),
                     Flags::COMPRESSED => decompress_data(&payload)?,
-                    Flags::ENCRYPTED => decrypt_with_aes_gcm(&payload, &encryption_key)?,
                     _ => payload,
                 };
             }
