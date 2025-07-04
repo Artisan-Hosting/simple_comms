@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use dusa_collection_utils::{errors::ErrorArrayItem, types::stringy::Stringy, version::Version};
+use dusa_collection_utils::core::{errors::ErrorArrayItem, types::stringy::Stringy, version::Version};
 use get_if_addrs::{IfAddr, get_if_addrs};
 
 use crate::RELEASEINFO;

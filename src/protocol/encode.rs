@@ -1,4 +1,4 @@
-use dusa_collection_utils::errors::ErrorArrayItem;
+use dusa_collection_utils::core::errors::ErrorArrayItem;
 
 pub fn encode_data(data: &[u8]) -> Vec<u8> {
     // Encode the data into a hex string and convert it into bytes

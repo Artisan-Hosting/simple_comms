@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
-use dusa_collection_utils::logger::LogLevel;
-use dusa_collection_utils::{log, version::Version};
+use dusa_collection_utils::core::logger::LogLevel;
+use dusa_collection_utils::{log, core::version::Version};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 use crate::network::utils::{comms_version, get_local_ip};

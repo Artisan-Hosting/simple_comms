@@ -1,4 +1,4 @@
-use dusa_collection_utils::version::VersionCode;
+use dusa_collection_utils::core::version::VersionCode;
 
 pub mod protocol;
 pub mod network;
