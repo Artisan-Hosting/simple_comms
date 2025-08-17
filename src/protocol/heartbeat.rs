@@ -1,0 +1,1 @@
+// send empty paylod with a header type as heartbeat

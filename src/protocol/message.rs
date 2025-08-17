@@ -1,41 +1,58 @@
 use std::io::{self, Cursor};
 
 use crate::{
+    RELEASEINFO,
     network::utils::{get_header_version, get_local_ip},
     protocol::{
         checksum::{generate_checksum, verify_checksum},
         compression::{compress_data, decompress_data},
         encode::{decode_data, encode_data},
-        encryption::{decrypt_with_aes_gcm, encrypt_with_aes_gcm, generate_key},
-        flags::Flags,
-        header::HEADER_LENGTH,
+        encryption::{
+            decrypt_with_aes_gcm, encrypt_with_aes_gcm, encrypt_with_aes_gcm_session, generate_key,
+        },
+        flags::{Flags, MsgType},
+        header::{HEADER_LENGTH, RecordMeta},
         io_helpers::read_with_std_io,
         padding::{
             add_padding_with_scheme, pkcs7_padding, pkcs7_validation, remove_padding_with_scheme,
         },
         status::ProtocolStatus,
     },
-    RELEASEINFO,
 };
 
 use super::{
-    header::{ProtocolHeader, EOL},
+    header::{EOL, ProtocolHeader},
     reserved::Reserved,
 };
 use dusa_collection_utils::core::logger::LogLevel;
-use dusa_collection_utils::{log, core::version::Version};
+use dusa_collection_utils::{core::version::Version, log};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionCtx {
+    pub session_id: [u8; 16],
+    pub key: [u8; 32],
+    pub next_seq: u64, // incremented per record
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProtocolMessage<T> {
     pub header: ProtocolHeader,
     pub payload: T,
+
+    #[serde(skip)]
+    session: Option<SessionCtx>,
 }
 
 impl<T> ProtocolMessage<T>
 where
     T: Serialize + for<'a> Deserialize<'a> + std::fmt::Debug + Clone,
 {
+    pub fn with_session(mut self, session: SessionCtx) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     // Create a new protocol message
     pub fn new(flags: Flags, payload: T) -> io::Result<Self> {
         let origin_address: [u8; 4] = get_local_ip().octets();
@@ -77,25 +94,64 @@ where
         let mut payload_bytes: Vec<u8> =
             add_padding_with_scheme(&payload_bytes_unpadded, 16, pkcs7_padding);
 
+        // ! Depricating to use keep the session data in that field
         // Generate a random key for AES-GCM encryption
-        let mut encryption_key: [u8; 32] = [0u8; 32];
-        generate_key(&mut encryption_key);
+        // let mut encryption_key: [u8; 32] = [0u8; 32];
+        // generate_key(&mut encryption_key);
 
         let flags = Flags::from_bits_truncate(self.header.flags);
+        let mut meta: Option<RecordMeta> = None;
         for flag in Self::ordered_flags() {
             if flags.contains(flag) {
                 payload_bytes = match flag {
                     Flags::COMPRESSED => compress_data(&payload_bytes)?,
                     Flags::ENCODED => encode_data(&payload_bytes),
-                    Flags::ENCRYPTED => encrypt_with_aes_gcm(&payload_bytes, &encryption_key)?,
+                    Flags::ENCRYPTED => {
+                        // New: derive per-record meta and encrypt with session key
+                        let sess = self.session.ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "missing session context")
+                        })?;
+
+                        // increment seq_no and generate a fresh 96-bit nonce
+                        let seq_no = sess.next_seq; // (or bump and store back if you keep it mutable)
+                        let mut nonce: [u8; 12] = [0u8; 12];
+                        generate_key(&mut nonce); // reuse your RNG helper
+
+                        // stamp header meta
+                        let m = RecordMeta {
+                            session_id: sess.session_id,
+                            seq_no,
+                            nonce,
+                        };
+
+                        meta = Some(m);
+                        
+                        (&mut self.header).set_meta(&m);
+
+                        // AAD = session_id||seq_no (16 bytes)
+                        let mut aad = [0u8; 16];
+                        aad[..8].copy_from_slice(&m.session_id);
+                        aad[8..16].copy_from_slice(&m.seq_no.to_be_bytes());
+
+                        // encrypt in-place logic (no nonce in ciphertext)
+                        payload_bytes = encrypt_with_aes_gcm_session(
+                            &payload_bytes,
+                            &sess.key,
+                            &m.nonce,
+                            &aad,
+                        )?;
+
+                        payload_bytes
+                    }
                     Flags::SIGNATURE => generate_checksum(&mut payload_bytes),
                     _ => payload_bytes,
                 };
             }
-        }        
+        }
 
         // Set payload length after transformations
         self.header.payload_length = payload_bytes.len() as u64;
+
 
         // Manually serialize the header fields into a fixed-size buffer
         let mut header_bytes: Vec<u8> = Vec::with_capacity(HEADER_LENGTH);
@@ -106,7 +162,12 @@ where
         header_bytes.extend(&self.header.status.to_be_bytes()); // Updated
         header_bytes.extend(&self.header.origin_address);
         if flags.contains(Flags::ENCRYPTED) {
-            header_bytes.extend(&encryption_key); // Append the encryption key
+            if let Some(meta) = meta {
+                header_bytes.extend(iter);
+            }
+
+
+            header_bytes.extend(&); // Append the encryption key
         } else {
             header_bytes.extend([0u8; 32]); // appened 0's to satify the key legnth
         }
@@ -241,5 +302,12 @@ where
         let mut message_bytes: Vec<u8> = message.to_bytes().await?;
         message_bytes.extend_from_slice(EOL);
         return Ok(message_bytes);
+    }
+
+    fn set_type(h: &mut ProtocolHeader, t: MsgType) {
+        h.reserved = t.into();
+    }
+    fn get_type(h: &ProtocolHeader) -> MsgType {
+        MsgType::from(h.reserved)
     }
 }

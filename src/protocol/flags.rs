@@ -11,6 +11,8 @@ bitflags::bitflags! {
         const ENCODED    = 0b0000_0100;
         const SIGNATURE  = 0b0000_1000;
         const OPTIMIZED  = 0b0000_1111; //
+        const READY      = 0b0001_0000; // peer finished handshake
+        const RESUMED    = 0b0010_0000; // connection resume in effect
         // Add other flags as needed
     }
 }
@@ -40,6 +42,37 @@ impl fmt::Display for Flags {
         if self.contains(Flags::OPTIMIZED) {
             flags.push("SECURE".bright_green().bold().to_string());
         }
+        if self.contains(Flags::READY) {
+            flags.push("READY".bright_green().bold().to_string());
+        }
+        if self.contains(Flags::RESUMED) {
+            flags.push("RESUME".bright_blue().bold().to_string());
+        }
         write!(f, "{}", flags.join(", "))
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MsgType {
+    Hello = 0x01,
+    HelloAck = 0x02,
+    Open = 0x03,
+    OpenAck = 0x04,
+    Data = 0x05,
+    Heartbeat = 0x06,
+    Close = 0x07,
+    Error = 0x08,
+    Rekey = 0x09,
+}
+
+impl From<u8> for MsgType {
+    fn from(b: u8) -> Self {
+        unsafe { std::mem::transmute(b) }
+    }
+}
+impl From<MsgType> for u8 {
+    fn from(t: MsgType) -> u8 {
+        t as u8
     }
 }
