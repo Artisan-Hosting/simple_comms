@@ -64,11 +64,24 @@ pub enum MsgType {
     Close = 0x07,
     Error = 0x08,
     Rekey = 0x09,
+    /// Used for unknown/unsupported values.
+    Unknown = 0xff,
 }
 
 impl From<u8> for MsgType {
     fn from(b: u8) -> Self {
-        unsafe { std::mem::transmute(b) }
+        match b {
+            0x01 => MsgType::Hello,
+            0x02 => MsgType::HelloAck,
+            0x03 => MsgType::Open,
+            0x04 => MsgType::OpenAck,
+            0x05 => MsgType::Data,
+            0x06 => MsgType::Heartbeat,
+            0x07 => MsgType::Close,
+            0x08 => MsgType::Error,
+            0x09 => MsgType::Rekey,
+            _ => MsgType::Unknown,
+        }
     }
 }
 impl From<MsgType> for u8 {
