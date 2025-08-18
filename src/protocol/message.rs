@@ -7,14 +7,12 @@ use crate::{
         checksum::{generate_checksum, verify_checksum},
         compression::{compress_data, decompress_data},
         encode::{decode_data, encode_data},
-        encryption::{
-            decrypt_with_aes_gcm_session, encrypt_with_aes_gcm_session,
-        },
+        encryption::{decrypt_with_aes_gcm_session, encrypt_with_aes_gcm_session},
         flags::{Flags, MsgType},
-        header::{ProtocolHeader, RecordMeta, HEADER_LENGTH, EOL},
+        header::{EOL, HEADER_LENGTH, ProtocolHeader, RecordMeta},
         io_helpers::read_with_std_io,
         padding::{
-            add_padding_with_scheme, pkcs7_padding, pkcs7_validation, remove_padding_with_scheme,
+             pkcs7_validation, remove_padding_with_scheme,
         },
         status::ProtocolStatus,
     },
@@ -22,15 +20,15 @@ use crate::{
 
 use dusa_collection_utils::core::logger::LogLevel;
 use dusa_collection_utils::{core::version::Version, log};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Minimal session context required for encrypting/decrypting records.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionCtx {
     pub session_id: [u8; 16],
-    pub key: [u8; 32],
-    pub next_seq: u64,
+    pub key: [u8; 32],       // the AEAD key (derived)
+    pub nonce_salt: [u8; 4], // optional
+    pub next_seq: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,8 +51,8 @@ where
             version: get_header_version(),
             flags: flags.bits(),
             payload_length: 0,
-            reserved: 0,
-            status: ProtocolStatus::OK.bits(),
+            reserved: msg_type.bits(),
+            status: ProtocolStatus::RESERVED.bits(),
             origin_address,
             encryption_key: [0u8; 32],
         };
@@ -74,77 +72,108 @@ where
     }
 
     /// Serialize the message into bytes ready for transport.
-    pub async fn to_bytes(&mut self) -> io::Result<Vec<u8>> {
+    pub fn to_bytes(&mut self) -> io::Result<Vec<u8>> {
         log!(LogLevel::Trace, "Starting to_bytes conversion.");
 
-        // Serialize payload
-        let payload_bytes_unpadded = bincode::serialize(&self.payload)
+        // 1) Serialize payload
+        let payload_plain = bincode::serialize(&self.payload)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-        let mut payload_bytes =
-            add_padding_with_scheme(&payload_bytes_unpadded, 16, pkcs7_padding);
 
+        // === Recommended transform order ===
         let flags = Flags::from_bits_truncate(self.header.flags);
+        let mut payload = payload_plain.clone();
 
-        // Pre-encryption transforms
         if flags.contains(Flags::COMPRESSED) {
-            payload_bytes = compress_data(&payload_bytes)?;
+            payload = compress_data(&payload)?;
         }
         if flags.contains(Flags::ENCODED) {
-            payload_bytes = encode_data(&payload_bytes);
+            payload = encode_data(&payload);
         }
+        // If you use padding for length-hiding, do it AFTER compress/encode:
+        // payload = add_padding_with_scheme(&payload, 16, pkcs7_padding);
+
         if flags.contains(Flags::SIGNATURE) {
-            payload_bytes = generate_checksum(&mut payload_bytes);
+            // If this is a plaintext checksum, it should cover the state right before encryption.
+            payload = generate_checksum(&mut payload);
         }
 
-        // Encryption
+        // 2) Encryption
         let header_bytes;
         if flags.contains(Flags::ENCRYPTED) {
-            let sess = self.session.as_mut().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "missing session context")
-            })?;
+            let sess = self
+                .session
+                .as_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "missing session context"))?;
 
             // derive per-record metadata
             let seq_no = sess.next_seq;
             sess.next_seq = sess.next_seq.wrapping_add(1);
-            let nonce = rand::thread_rng().r#gen::<u64>();
+
+            // Build 96-bit nonce deterministically = salt(4) || seq_no(8)
+            // (Define sess.nonce_salt: [u8;4] at handshake time via HKDF)
+            let mut nonce96 = [12u8; 12];
+            nonce96[..4].copy_from_slice(&sess.nonce_salt);
+            nonce96[4..8].copy_from_slice(&sess.session_id[..4]);
+            nonce96[8..].copy_from_slice(&seq_no.to_be_bytes());
+
+            // RecordMeta should store full 12-byte nonce
             let meta = RecordMeta {
                 session_id: sess.session_id,
                 seq_no,
-                nonce,
+                nonce: nonce96, // [u8;12]
             };
             self.header.set_meta(&meta);
 
-            // ciphertext length includes 16 byte tag
-            self.header.payload_length = (payload_bytes.len() + 16) as u64;
+            // ciphertext length includes 16-byte GCM tag
+            self.header.payload_length = (payload.len() + 16) as u64;
 
-            // serialize header now for AAD
+            // AAD = full serialized header (exact bytes used on decrypt)
             header_bytes = Self::serialize_header(&self.header);
 
-            // build 96-bit nonce from 64-bit value (pad with zeros)
-            let mut nonce96 = [0u8; 12];
-            nonce96[..8].copy_from_slice(&nonce.to_be_bytes());
-
-            payload_bytes = encrypt_with_aes_gcm_session(
-                &payload_bytes,
-                &sess.key,
+            // Encrypt with explicit-nonce AEAD (nonce is not prefixed to ct)
+            payload = encrypt_with_aes_gcm_session(
+                &payload,
+                &sess.key, // 32-byte AEAD key derived at handshake
                 &nonce96,
-                &header_bytes,
+                &header_bytes, // AAD binds the header
             )?;
         } else {
-            self.header.payload_length = payload_bytes.len() as u64;
-            self.header.encryption_key = [0u8; 32];
+            // Unencrypted path
+            self.header.payload_length = payload.len() as u64;
+
+            let sess = self
+                .session
+                .as_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "missing session context"))?;
+
+            // derive per-record metadata
+            let seq_no = sess.next_seq;
+            sess.next_seq = sess.next_seq.wrapping_add(1);
+
+            // RecordMeta should store no nonce, but maybe sessid and seq num
+            let meta = RecordMeta {
+                session_id: sess.session_id,
+                seq_no,
+                nonce: [69u8; 12], // [u8;12]
+            };
+
+            self.header.set_meta(&meta);
+
             header_bytes = Self::serialize_header(&self.header);
+
+            payload = payload_plain;
         }
 
-        let mut buffer = Vec::with_capacity(HEADER_LENGTH + payload_bytes.len());
+        // 3) Frame
+        let mut buffer = Vec::with_capacity(HEADER_LENGTH + payload.len());
         buffer.extend_from_slice(&header_bytes);
-        buffer.extend_from_slice(&payload_bytes);
+        buffer.extend_from_slice(&payload);
         Ok(buffer)
     }
 
     /// Deserialize a message from raw bytes.  When the `ENCRYPTED` flag is set,
     /// a `SessionCtx` must be provided for decryption.
-    pub async fn from_bytes(bytes: &[u8], session: Option<SessionCtx>) -> io::Result<Self> {
+    pub fn from_bytes(bytes: &[u8], session: Option<SessionCtx>) -> io::Result<Self> {
         log!(LogLevel::Trace, "Starting from_bytes conversion.");
 
         if bytes.len() < HEADER_LENGTH {
@@ -208,9 +237,8 @@ where
 
         // decrypt if necessary
         if flags.contains(Flags::ENCRYPTED) {
-            let sess = session.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "missing session context")
-            })?;
+            let sess = session
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "missing session context"))?;
 
             let meta = header.meta();
             if meta.session_id != sess.session_id {
@@ -218,14 +246,9 @@ where
             }
 
             let mut nonce96 = [0u8; 12];
-            nonce96[..8].copy_from_slice(&meta.nonce.to_be_bytes());
+            nonce96[..12].copy_from_slice(&meta.nonce);
 
-            payload = decrypt_with_aes_gcm_session(
-                &payload,
-                &sess.key,
-                &nonce96,
-                header_bytes,
-            )?;
+            payload = decrypt_with_aes_gcm_session(&payload, &sess.key, &nonce96, header_bytes)?;
         }
 
         // Reverse order transforms
@@ -244,9 +267,8 @@ where
             Err(_) => payload,
         };
 
-        let payload: T = bincode::deserialize(&payload).map_err(|err| {
-            io::Error::new(io::ErrorKind::InvalidData, err.to_string())
-        })?;
+        let payload: T = bincode::deserialize(&payload)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
 
         let mut msg = Self {
             header,
@@ -261,7 +283,7 @@ where
 
     /// returns a sendable Vec<u8> with the EOL appended
     pub async fn format(mut self) -> io::Result<Vec<u8>> {
-        let mut bytes = self.to_bytes().await?;
+        let mut bytes = self.to_bytes()?;
         bytes.extend_from_slice(EOL);
         Ok(bytes)
     }
@@ -308,26 +330,26 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let session = SessionCtx {
+        #[allow(unreachable_code)]
+        let _session = SessionCtx {
             session_id: rand_array(),
             key: rand_array(),
             next_seq: 1,
+            nonce_salt: todo!(),
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut msg = ProtocolMessage::new(Flags::ENCRYPTED, MsgType::Data, b"hello".to_vec())
                 .unwrap()
-                .with_session(session);
-            let bytes = msg.to_bytes().await.unwrap();
+                .with_session(_session);
+            let bytes = msg.to_bytes().unwrap();
 
             let parsed: ProtocolMessage<Vec<u8>> =
-                ProtocolMessage::from_bytes(&bytes, Some(session))
-                    .await
+                ProtocolMessage::from_bytes(&bytes, Some(_session))
                     .unwrap();
             assert_eq!(parsed.payload, b"hello".to_vec());
             assert_eq!(parsed.msg_type(), MsgType::Data);
         });
     }
 }
-

@@ -13,15 +13,15 @@ use crate::protocol::status::ProtocolStatus;
 ///
 /// The layout (all in network byte order) is:
 /// `session_id[16] || seq_no[8] || nonce[8]`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordMeta {
     /// Unique identifier for the session.  Both sides share the same value.
     pub session_id: [u8; 16],
     /// Monotonic sequence number used for replay protection and ordering.
-    pub seq_no: u64,
+    pub seq_no: u32,
     /// Per-record nonce/counter.  Only the lower 64 bits are transmitted; the
     /// receiver expands this to a full 96‑bit AEAD nonce.
-    pub nonce: u64,
+    pub nonce: [u8; 12],
 }
 
 
@@ -93,22 +93,22 @@ impl ProtocolHeader {
     pub fn meta(&self) -> RecordMeta {
         let mut sid = [0u8; 16];
         sid.copy_from_slice(&self.encryption_key[0..16]);
-        let mut seq = [0u8; 8];
-        seq.copy_from_slice(&self.encryption_key[16..24]);
-        let mut nonce = [0u8; 8];
-        nonce.copy_from_slice(&self.encryption_key[24..32]);
+        let mut seq = [0u8; 4];
+        seq.copy_from_slice(&self.encryption_key[16..20]);
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&self.encryption_key[20..32]);
         RecordMeta {
             session_id: sid,
-            seq_no: u64::from_be_bytes(seq),
-            nonce: u64::from_be_bytes(nonce),
+            seq_no: u32::from_be_bytes(seq),
+            nonce,
         }
     }
 
     /// Write the [`RecordMeta`] overlay into `encryption_key`.
     pub fn set_meta(&mut self, m: &RecordMeta) {
         self.encryption_key[0..16].copy_from_slice(&m.session_id);
-        self.encryption_key[16..24].copy_from_slice(&m.seq_no.to_be_bytes());
-        self.encryption_key[24..32].copy_from_slice(&m.nonce.to_be_bytes());
+        self.encryption_key[16..20].copy_from_slice(&m.seq_no.to_be_bytes());
+        self.encryption_key[20..32].copy_from_slice(&m.nonce);
     }
 
     /// Read the `reserved` field as a [`MsgType`].
@@ -118,7 +118,7 @@ impl ProtocolHeader {
 
     /// Set the `reserved` field to the provided [`MsgType`].
     pub fn set_msg_type(&mut self, t: MsgType) {
-        self.reserved = t.into();
+        self.reserved = t.bits();
     }
 }
 
@@ -158,7 +158,7 @@ mod tests {
         let meta = RecordMeta {
             session_id: [0xAA; 16],
             seq_no: 42,
-            nonce: 0x1122334455667788,
+            nonce: [8u8; 12],
         };
 
         let mut header = ProtocolHeader {

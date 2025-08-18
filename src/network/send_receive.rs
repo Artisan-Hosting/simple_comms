@@ -39,7 +39,7 @@ where
     // message.header.reserved = Flags::NONE.bits();
 
     // Creating message bytes and appending eol
-    let mut serialized_message: Vec<u8> = message.to_bytes().await?;
+    let mut serialized_message: Vec<u8> = message.to_bytes()?;
     serialized_message.extend(EOL);
 
     log!(LogLevel::Trace, "message serialized for sending");
@@ -67,7 +67,7 @@ where
             }
 
             let response: ProtocolMessage<RESPONSE> =
-                ProtocolMessage::from_bytes(&response_buffer, None).await?;
+                ProtocolMessage::from_bytes(&response_buffer, None)?;
 
             let response_status: ProtocolStatus =
                 ProtocolStatus::from_bits_truncate(response.header.status);
@@ -147,7 +147,7 @@ where
         buffer.truncate(pos);
     }
 
-    match ProtocolMessage::<RESPONSE>::from_bytes(&buffer, None).await {
+    match ProtocolMessage::<RESPONSE>::from_bytes(&buffer, None) {
         Ok(message) => {
             log!(LogLevel::Debug, "Received message: {:?}", message);
 
@@ -172,7 +172,7 @@ pub async fn create_response(status: ProtocolStatus) -> Result<Vec<u8>, io::Erro
     let mut message: ProtocolMessage<()> =
         ProtocolMessage::new(Flags::NONE, MsgType::Data, ())?;
     message.header.status = status.bits();
-    let mut message_bytes = message.to_bytes().await?;
+    let mut message_bytes = message.to_bytes()?;
     message_bytes.extend_from_slice(EOL);
     return Ok(message_bytes);
 }
