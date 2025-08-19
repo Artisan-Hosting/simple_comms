@@ -52,27 +52,40 @@ impl fmt::Display for Flags {
     }
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum MsgType {
-    Hello = 0x01,
-    HelloAck = 0x02,
-    Open = 0x03,
-    OpenAck = 0x04,
-    Data = 0x05,
-    Heartbeat = 0x06,
-    Close = 0x07,
-    Error = 0x08,
-    Rekey = 0x09,
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct MsgType: u8 {
+        const Hello     = 0b0000_0001;
+        const HelloAck  = 0b0000_0010;
+        const Open      = 0b0000_0100;
+        const OpenAck   = 0b0000_1000;
+        const Data      = 0b0001_0000;
+        const Heartbeat = 0b0010_0000;
+        const Close     = 0b0100_0000;
+        const Error     = 0b1000_0000;
+        const Rekey     = 0b0101_0000;
+        const Unknown   = 0b1111_1111;
+    }
 }
 
 impl From<u8> for MsgType {
     fn from(b: u8) -> Self {
-        unsafe { std::mem::transmute(b) }
+        match b {
+            0b0000_0001 => MsgType::Hello,
+            0b0000_0010 => MsgType::HelloAck,
+            0b0000_0100 => MsgType::Open,
+            0b0000_1000 => MsgType::OpenAck,
+            0b0001_0000 => MsgType::Data,
+            0b0010_0001 => MsgType::Heartbeat,
+            0b0100_0000 => MsgType::Close,
+            0b1000_0000 => MsgType::Error,
+            0b0101_0000 => MsgType::Rekey,
+            _ => MsgType::Unknown,
+        }
     }
 }
-impl From<MsgType> for u8 {
-    fn from(t: MsgType) -> u8 {
-        t as u8
-    }
-}
+// impl From<MsgType> for u8 {
+    // fn from(t: MsgType) -> u8 {
+        // t as u8
+    // }
+// }

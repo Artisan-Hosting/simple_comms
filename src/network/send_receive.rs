@@ -5,7 +5,14 @@ use dusa_collection_utils::{log, core::version::Version};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 use crate::network::utils::{comms_version, get_local_ip};
-use crate::protocol::{flags::Flags, header::EOL, io_helpers::read_until, message::ProtocolMessage, proto::Proto, status::ProtocolStatus};
+use crate::protocol::{
+    flags::{Flags, MsgType},
+    header::EOL,
+    io_helpers::read_until,
+    message::{ProtocolMessage},
+    proto::Proto,
+    status::ProtocolStatus,
+};
 
 
 pub async fn send_message<STREAM, DATA, RESPONSE>(
@@ -20,7 +27,8 @@ where
     DATA: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Unpin,
     RESPONSE: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Unpin,
 {
-    let mut message: ProtocolMessage<DATA> = ProtocolMessage::new(flags, data.clone())?;
+    let mut message: ProtocolMessage<DATA> =
+        ProtocolMessage::new(flags, MsgType::Data, data.clone())?;
 
     match proto {
         Proto::TCP => message.header.origin_address = get_local_ip().octets(),
@@ -31,7 +39,7 @@ where
     // message.header.reserved = Flags::NONE.bits();
 
     // Creating message bytes and appending eol
-    let mut serialized_message: Vec<u8> = message.to_bytes().await?;
+    let mut serialized_message: Vec<u8> = message.to_bytes()?;
     serialized_message.extend(EOL);
 
     log!(LogLevel::Trace, "message serialized for sending");
@@ -59,7 +67,7 @@ where
             }
 
             let response: ProtocolMessage<RESPONSE> =
-                ProtocolMessage::from_bytes(&response_buffer).await?;
+                ProtocolMessage::from_bytes(&response_buffer, None)?;
 
             let response_status: ProtocolStatus =
                 ProtocolStatus::from_bits_truncate(response.header.status);
@@ -139,7 +147,7 @@ where
         buffer.truncate(pos);
     }
 
-    match ProtocolMessage::<RESPONSE>::from_bytes(&buffer).await {
+    match ProtocolMessage::<RESPONSE>::from_bytes(&buffer, None) {
         Ok(message) => {
             log!(LogLevel::Debug, "Received message: {:?}", message);
 
@@ -161,9 +169,10 @@ where
 
 // * Sending and recieving helpers
 pub async fn create_response(status: ProtocolStatus) -> Result<Vec<u8>, io::Error> {
-    let mut message: ProtocolMessage<()> = ProtocolMessage::new(Flags::NONE, ())?;
+    let mut message: ProtocolMessage<()> =
+        ProtocolMessage::new(Flags::NONE, MsgType::Data, ())?;
     message.header.status = status.bits();
-    let mut message_bytes = message.to_bytes().await?;
+    let mut message_bytes = message.to_bytes()?;
     message_bytes.extend_from_slice(EOL);
     return Ok(message_bytes);
 }
