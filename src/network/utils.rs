@@ -1,3 +1,6 @@
+//! Small helpers for stamping messages with version/origin metadata and for
+//! discovering this host's own IP addresses.
+
 use std::net::{IpAddr, Ipv4Addr};
 
 use dusa_collection_utils::core::{errors::ErrorArrayItem, types::stringy::Stringy, version::Version};
@@ -5,6 +8,9 @@ use get_if_addrs::{IfAddr, get_if_addrs};
 
 use crate::RELEASEINFO;
 
+/// This crate's own version, tagged with [`crate::RELEASEINFO`]. Compared
+/// against an incoming message's header version in
+/// [`crate::network::send_receive::send_message`] to detect protocol drift.
 pub fn comms_version() -> Version {
     let version = env!("CARGO_PKG_VERSION");
     let mut parts = version.split('.');
@@ -19,11 +25,16 @@ pub fn comms_version() -> Version {
     }
 }
 
+/// [`comms_version`], encoded into the `u16` that goes in
+/// [`crate::protocol::header::ProtocolHeader::version`].
 pub fn get_header_version() -> u16 {
     let lib_version = comms_version();
     lib_version.encode()
 }
 
+/// The first non-loopback IPv4 address on any local interface, or
+/// `127.0.0.1` if none is found. Used to stamp `origin_address` on outgoing
+/// TCP messages.
 pub fn get_local_ip() -> Ipv4Addr {
     let if_addrs = match get_if_addrs() {
         Ok(addrs) => addrs,
@@ -41,6 +52,9 @@ pub fn get_local_ip() -> Ipv4Addr {
     Ipv4Addr::LOCALHOST // Return loopback address if no suitable non-loopback address is found
 }
 
+/// This host's public IP, as seen by an external service. Not used
+/// internally by the protocol -- provided for callers building
+/// discovery/registration on top of it.
 pub async fn get_external_ip() -> Result<IpAddr, ErrorArrayItem> {
     let url = "https://api.ipify.org"; // Alternatively, use "https://ifconfig.me"
     let response = reqwest::get(url).await?.text().await?;
