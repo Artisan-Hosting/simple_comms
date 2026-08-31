@@ -1,10 +1,18 @@
+//! Which transport a message is being sent over. A handful of framing
+//! details (e.g. origin address, flushing behavior) differ between the two.
+
 use std::fmt;
 
 use colored::{ColoredString, Colorize};
 
+/// The underlying transport for a connection.
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 pub enum Proto {
+    /// A TCP socket -- `origin_address` is populated with the local host's
+    /// IP (see [`crate::network::utils::get_local_ip`]).
     TCP,
+    /// A Unix domain socket -- `origin_address` is left zeroed, since a
+    /// local IP is meaningless.
     UNIX,
 }
 

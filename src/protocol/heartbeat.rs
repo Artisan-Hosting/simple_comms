@@ -1,3 +1,9 @@
+//! Liveness tracking for a connection, independent of the wire format
+//! itself. [`crate::protocol::flags::MsgType::Heartbeat`] is the frame type
+//! carried over the wire; this module just tracks local timestamps and
+//! judges health from them -- it isn't wired into
+//! [`crate::network::send_receive`] yet.
+
 use std::time::{Duration, Instant};
 
 /// Tracks heartbeat send/receive times and determines connection health.
@@ -7,10 +13,15 @@ pub struct Heartbeat {
     last_recv: Instant,
 }
 
+/// Connection health inferred from elapsed time since the last received
+/// heartbeat, relative to [`Heartbeat`]'s configured interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatState {
+    /// Less than 3 intervals have elapsed since the last receive.
     Healthy,
+    /// Between 3 and 5 intervals have elapsed -- the peer may be gone.
     Suspect,
+    /// 5 or more intervals have elapsed -- treat the peer as gone.
     Timeout,
 }
 

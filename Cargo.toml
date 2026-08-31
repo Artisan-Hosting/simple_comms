@@ -9,6 +9,7 @@ authors = [
 description = "Rust implementation of a communication protocol for AH"
 homepage = "https://docs.artisanhosting.net"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 
 [dependencies]
 aes-gcm = "0.10.3"
@@ -23,4 +24,5 @@ rand = "0.8.5"
 reqwest = "0.12.9"
 serde = "1.0.216"
 sha2 = "0.10.8"
+snow = "0.10.0"
 tokio = "1.42.0"

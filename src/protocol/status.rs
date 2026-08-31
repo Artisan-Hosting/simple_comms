@@ -1,6 +1,13 @@
+//! Outcome flags carried in a response header's `status` byte -- distinct
+//! from [`crate::protocol::flags::ConnectionParams`] (payload/connection
+//! transforms) and [`crate::protocol::flags::MsgType`] (what kind of
+//! message this is). `ProtocolStatus` composes several base flags into
+//! higher-level outcomes (`SIDEGRADE`, `OUTOFBAND`, ...) that
+//! [`crate::network::send_receive`] branches on.
+
 use std::fmt;
 
-use colored::Color;
+use colored::{Color, Colorize};
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +16,12 @@ bitflags::bitflags! {
         const OK        = 0b0000_0001;
         const ERROR     = 0b0000_0010;
         const WAITING   = 0b0000_0100;
+        /// Peer finished the `Hello`/`HelloAck` handshake. Relocated here
+        /// from `ConnectionParams` (where it was never actually checked
+        /// anywhere) since it describes connection/negotiation outcome,
+        /// not a payload transform. Still unimplemented -- reserved for
+        /// when handshake-state signaling is actually built.
+        const READY     = 0b0000_1000;
 
         // Error Flags
         const MALFORMED = 0b0001_0000; // The message fit what we were expecting but was trash
@@ -26,7 +39,9 @@ bitflags::bitflags! {
 
         // Sidegrade
 
-        /// A request to change the flags the message was send with based on the reserved field
+        /// A request to change the connection params the message was sent
+        /// with, based on the `reserved` field. See
+        /// [`crate::network::send_receive::send_sidegrade`].
         const SIDEGRADE = Self::WAITING.bits() | Self::MALFORMED.bits() | Self::RESERVED.bits();
 
         // Time codes
@@ -43,6 +58,8 @@ bitflags::bitflags! {
 }
 
 impl ProtocolStatus {
+    /// Whether every bit of `flag` (including composite flags like
+    /// `SIDEGRADE`) is set.
     pub fn has_flag(&self, flag: ProtocolStatus) -> bool {
         self.contains(flag)
     }
@@ -59,26 +76,56 @@ impl ProtocolStatus {
         self.contains(ProtocolStatus::WAITING)
     }
 
+    /// A terminal color for logging/CLI display.
     pub fn get_status_color(&self) -> Color {
-        match *self {
-            ProtocolStatus::OK => Color::Green,
-            ProtocolStatus::ERROR => Color::Red,
-            ProtocolStatus::WAITING => Color::Yellow,
-            ProtocolStatus::SIDEGRADE => Color::BrightMagenta,
-            _ => Color::White,
+        if self.contains(ProtocolStatus::SIDEGRADE) {
+            Color::BrightMagenta
+        } else if self.contains(ProtocolStatus::ERROR) {
+            Color::Red
+        } else if self.contains(ProtocolStatus::WAITING) {
+            Color::Yellow
+        } else if self.contains(ProtocolStatus::OK) {
+            Color::Green
+        } else {
+            Color::White
         }
     }
 }
 
 impl fmt::Display for ProtocolStatus {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let description = match *self {
-            ProtocolStatus::OK => "OK",
-            ProtocolStatus::ERROR => "Error",
-            ProtocolStatus::WAITING => "Waiting",
-            ProtocolStatus::SIDEGRADE => "SideGrade",
-            _ => "Unknown",
-        };
-        write!(f, "{}", description)
+        // Composable, like ConnectionParams's Display -- a single status
+        // byte can carry several bits at once (e.g. SIDEGRADE is WAITING |
+        // MALFORMED | RESERVED, and READY can co-occur with OK).
+        let mut parts = vec![];
+        if self.contains(ProtocolStatus::SIDEGRADE) {
+            parts.push("SideGrade".bright_magenta().to_string());
+        } else {
+            if self.contains(ProtocolStatus::OK) {
+                parts.push("OK".green().to_string());
+            }
+            if self.contains(ProtocolStatus::ERROR) {
+                parts.push("Error".red().to_string());
+            }
+            if self.contains(ProtocolStatus::WAITING) {
+                parts.push("Waiting".yellow().to_string());
+            }
+            if self.contains(ProtocolStatus::MALFORMED) {
+                parts.push("Malformed".red().to_string());
+            }
+            if self.contains(ProtocolStatus::REFUSED) {
+                parts.push("Refused".red().to_string());
+            }
+            if self.contains(ProtocolStatus::VERSION) {
+                parts.push("VersionMismatch".red().to_string());
+            }
+        }
+        if self.contains(ProtocolStatus::READY) {
+            parts.push("READY".bright_green().bold().to_string());
+        }
+        if parts.is_empty() {
+            parts.push("Unknown".to_string());
+        }
+        write!(f, "{}", parts.join(", "))
     }
 }

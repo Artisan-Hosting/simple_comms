@@ -1,11 +1,29 @@
+//! Standalone AES-256-GCM helpers with a random, self-describing (nonce
+//! prefixed to ciphertext) framing. These predate the `Noise_NK` handshake
+//! (see [`crate::protocol::handshake`]) and connection-scoped
+//! [`crate::protocol::message::ConnectionCtx`] that secure `Data` traffic
+//! when `ConnectionParams::ENCRYPTED` is set.
+//!
+//! [`ProtocolMessage::to_bytes`](crate::protocol::message::ProtocolMessage::to_bytes)
+//! still uses these directly as its fallback for messages sent *without*
+//! `ConnectionParams::ENCRYPTED` (including `Hello`/`HelloAck` themselves): a fresh
+//! key is generated per message and carried in the header alongside the
+//! ciphertext, which obscures the payload but provides no real
+//! confidentiality (see that function's doc comment). They also remain
+//! available standalone for callers who want ad hoc, out-of-band AES-GCM
+//! encryption with a key they manage themselves.
+
 use std::io;
 
 use aes_gcm::{
-    aead::{Aead, OsRng, Payload},
     AeadCore, Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, OsRng},
 };
 use rand::Rng;
 
+/// Encrypts `data` under `key` with a fresh random 96-bit nonce, and
+/// prefixes that nonce to the returned ciphertext so [`decrypt_with_aes_gcm`]
+/// can recover it without a separate channel.
 pub fn encrypt_with_aes_gcm(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -15,6 +33,8 @@ pub fn encrypt_with_aes_gcm(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> 
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption error: {:?}", e)))
 }
 
+/// Reverses [`encrypt_with_aes_gcm`]: splits the leading 12-byte nonce off
+/// `data` and decrypts the remainder under `key`.
 pub fn decrypt_with_aes_gcm(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
 
@@ -36,37 +56,11 @@ pub fn decrypt_with_aes_gcm(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> 
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption error: {:?}", e)))
 }
 
+/// Fills `buffer` with cryptographically random bytes (e.g. for a 32-byte
+/// key to use with [`encrypt_with_aes_gcm`]).
 pub fn generate_key(buffer: &mut [u8]) {
     let mut rng = rand::thread_rng(); // Create a random number generator
     for byte in buffer.iter_mut() {
         *byte = rng.r#gen(); // Fill each byte with random data
     }
-}
-
-// New: explicit-nonce encrypt that does NOT prefix nonce to the ciphertext
-pub fn encrypt_with_aes_gcm_session(
-    data: &[u8],
-    session_key: &[u8; 32],
-    nonce_96: &[u8; 12],
-    aad: &[u8],               // e.g., seq_no or (session_id||seq_no)
-) -> io::Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(session_key.into());
-    let nonce = Nonce::from_slice(nonce_96); // 96-bit nonce
-    cipher
-        .encrypt(nonce, Payload { msg: data, aad })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption error: {:?}", e)))
-}
-
-// New: explicit-nonce decrypt to match the above
-pub fn decrypt_with_aes_gcm_session(
-    ciphertext: &[u8],
-    session_key: &[u8; 32],
-    nonce_96: &[u8; 12],
-    aad: &[u8],
-) -> io::Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(session_key.into());
-    let nonce = Nonce::from_slice(nonce_96);
-    cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption error: {:?}", e)))
 }
