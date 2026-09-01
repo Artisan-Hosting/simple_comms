@@ -275,6 +275,45 @@ elapsed time, ...) -- that policy is left to the caller.
 value describing what went wrong rather than a normal payload. Neither has
 handshake-specific logic beyond normal message framing.
 
+## `ConnectionDriver`: full-duplex sessions
+
+Everything above -- `send_message`/`receive_message` in `send_receive.rs`
+-- is strict half-duplex RPC: one send, blocked on exactly one reply, over
+a single `&mut STREAM`. That's enough for simple request/response use, but
+it can't express either peer pushing a `Data` message at any time
+independent of a reply, and there's no way for one part of an application
+to keep sending while another keeps receiving on the same connection.
+
+[`network::driver::ConnectionDriver`](../src/network/driver.rs) is the
+full-duplex counterpart: `ConnectionDriver::spawn(stream, ctx, role,
+proto, config)` splits `stream` into independent read/write halves and
+spawns one background task that owns them (plus `ctx`) for the
+connection's lifetime, `select!`ing across an inbound read, an outbound
+queue, a rekey control channel, and a heartbeat timer. Because that one
+task is the *only* thing that ever touches `ctx` or the stream halves, no
+lock is needed around them -- every operation is naturally serialized, so
+a send can't race a rekey and no signal can be missed. It returns a
+`ConnectionHandle<APP>` with `send`/`recv`/`rekey`/`shutdown`; `recv`
+yields a `DriverMessage<APP>` for each dispatched `Data`/`Open`/`OpenAck`
+message (`Heartbeat`/`Rekey`/`Close`/`Hello`/`HelloAck` are handled
+internally and never surfaced to the caller).
+
+This also closes out two things that used to be listed here as
+unfinished:
+
+- **Heartbeats** ([`heartbeat.rs`](../src/protocol/heartbeat.rs)) are now
+  wired in: the driver sends `MsgType::Heartbeat` on `config.heartbeat_interval`,
+  marks receipt of the peer's, and tears the connection down once
+  `Heartbeat::state` reports `Timeout`.
+- **`Rekey` under concurrent traffic**: `rekey_initiator`/`rekey_responder`
+  originally assumed nothing else was reading/writing the connection
+  concurrently. The driver's exclusive single-task ownership makes both a
+  self-initiated (`ConnectionHandle::rekey`, initiator side only -- see
+  `ConnectionRole`) and peer-initiated (an incoming `MsgType::Rekey` frame,
+  responder side) rekey safe: it's processed inline, to completion, before
+  the loop's next iteration, so nothing else can be mid-flight against the
+  old cipher when the new one is swapped in.
+
 ## What's explicitly out of scope today
 
 - **0-RTT session resumption** (e.g. via a Noise PSK pattern like
@@ -285,8 +324,7 @@ handshake-specific logic beyond normal message framing.
 - **`ProtocolStatus::READY`** ("peer finished handshake") is defined
   (relocated here from `ConnectionParams`, where it was never checked) but
   still not read or set by anything.
-- **Heartbeats** ([`heartbeat.rs`](../src/protocol/heartbeat.rs)) track
-  liveness state locally but aren't wired into `send_receive.rs` -- nothing
-  currently sends or reacts to `MsgType::Heartbeat` automatically.
 - **Session-table bookkeeping** for `Open`/`OpenAck` (see above) is left to
-  the application.
+  the application, including on the driver's `recv()` path -- it dispatches
+  `Open`/`OpenAck` messages to the caller (optionally taggable/routable by
+  `RecordMeta::session_id`) but doesn't maintain a session table itself.

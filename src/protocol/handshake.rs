@@ -161,6 +161,46 @@ where
     Ok((transport, conn_id, params))
 }
 
+/// [`perform_handshake_initiator`], for callers holding independent
+/// read/write halves of a stream (e.g. [`crate::network::driver`]'s
+/// in-loop rekey, which only has a split `ReadHalf`/`WriteHalf` rather than
+/// one combined stream reference) instead of a single combined stream.
+/// `write_frame`/`read_frame` are already generic per-direction, so this is
+/// the same logic as [`perform_handshake_initiator`] -- kept as a sibling
+/// rather than having one call the other, since Rust's aliasing rules don't
+/// allow a combined-stream caller to pass `&mut stream` as two simultaneous
+/// `(read, write)` arguments to a shared implementation.
+pub async fn perform_handshake_initiator_rw<R, W>(
+    read: &mut R,
+    write: &mut W,
+    remote_static_pubkey: &[u8; 32],
+    params: ConnectionParams,
+) -> io::Result<(TransportState, [u8; 16], ConnectionParams)>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut initiator = Builder::new(NOISE_PARAMS.parse().map_err(noise_error)?)
+        .remote_public_key(remote_static_pubkey)
+        .map_err(noise_error)?
+        .build_initiator()
+        .map_err(noise_error)?;
+
+    let mut buf = vec![0u8; 65535];
+    let len = initiator.write_message(&[], &mut buf).map_err(noise_error)?;
+    write_frame(write, MsgType::Hello, buf[..len].to_vec(), params).await?;
+
+    let (ack_payload, _ack_flags) = read_frame(read, MsgType::HelloAck).await?;
+    let mut scratch = vec![0u8; 65535];
+    initiator
+        .read_message(&ack_payload, &mut scratch)
+        .map_err(noise_error)?;
+
+    let conn_id = conn_id_from_handshake(&initiator);
+    let transport = initiator.into_transport_mode().map_err(noise_error)?;
+    Ok((transport, conn_id, params))
+}
+
 /// Run the responder side of the `Noise_NK` handshake: receive `Hello`
 /// (adopting whatever [`ConnectionParams`] baseline it declares -- see
 /// `docs/HANDSHAKE.md`), send `HelloAck`, and return the resulting
@@ -188,6 +228,40 @@ where
     let mut buf = vec![0u8; 65535];
     let len = responder.write_message(&[], &mut buf).map_err(noise_error)?;
     write_frame(stream, MsgType::HelloAck, buf[..len].to_vec(), ConnectionParams::NONE).await?;
+
+    let conn_id = conn_id_from_handshake(&responder);
+    let transport = responder.into_transport_mode().map_err(noise_error)?;
+    Ok((transport, conn_id, hello_params))
+}
+
+/// [`perform_handshake_responder`], for callers holding independent
+/// read/write halves of a stream. See
+/// [`perform_handshake_initiator_rw`] for why this is a sibling rather than
+/// a shared implementation.
+pub async fn perform_handshake_responder_rw<R, W>(
+    read: &mut R,
+    write: &mut W,
+    identity: &NoiseIdentity,
+) -> io::Result<(TransportState, [u8; 16], ConnectionParams)>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut responder = Builder::new(NOISE_PARAMS.parse().map_err(noise_error)?)
+        .local_private_key(&identity.keypair.private)
+        .map_err(noise_error)?
+        .build_responder()
+        .map_err(noise_error)?;
+
+    let (hello_payload, hello_params) = read_frame(read, MsgType::Hello).await?;
+    let mut scratch = vec![0u8; 65535];
+    responder
+        .read_message(&hello_payload, &mut scratch)
+        .map_err(noise_error)?;
+
+    let mut buf = vec![0u8; 65535];
+    let len = responder.write_message(&[], &mut buf).map_err(noise_error)?;
+    write_frame(write, MsgType::HelloAck, buf[..len].to_vec(), ConnectionParams::NONE).await?;
 
     let conn_id = conn_id_from_handshake(&responder);
     let transport = responder.into_transport_mode().map_err(noise_error)?;
@@ -232,6 +306,30 @@ where
     Ok(ctx_from_handshake_result(noise, conn_id, params))
 }
 
+/// [`rekey_initiator`], for callers holding independent read/write halves
+/// of a stream (see [`perform_handshake_initiator_rw`]) -- this is what
+/// [`crate::network::driver`] calls to process a self-initiated rekey
+/// in-loop, since it only ever has split `ReadHalf`/`WriteHalf` values, not
+/// a combined stream.
+pub async fn rekey_initiator_rw<R, W>(
+    read: &mut R,
+    write: &mut W,
+    old: &mut ConnectionCtx,
+    remote_static_pubkey: &[u8; 32],
+) -> io::Result<ConnectionCtx>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let signal: ProtocolMessage<()> =
+        ProtocolMessage::new(ConnectionParams::ENCRYPTED, MsgType::Rekey, ())?;
+    signal.write_to(write, Proto::TCP, Some(old)).await?;
+
+    let (noise, conn_id, params) =
+        perform_handshake_initiator_rw(read, write, remote_static_pubkey, old.params).await?;
+    Ok(ctx_from_handshake_result(noise, conn_id, params))
+}
+
 /// Responder-side counterpart to [`rekey_initiator`]. The caller's receive
 /// loop must first read and decrypt the incoming `MsgType::Rekey` message
 /// with the *old* `ConnectionCtx` (the same way any other encrypted message
@@ -244,6 +342,23 @@ where
     STREAM: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let (noise, conn_id, params) = perform_handshake_responder(stream, identity).await?;
+    Ok(ctx_from_handshake_result(noise, conn_id, params))
+}
+
+/// [`rekey_responder`], for callers holding independent read/write halves
+/// of a stream -- what [`crate::network::driver`] calls in-loop when it
+/// observes a peer-initiated `MsgType::Rekey` signal. See
+/// [`rekey_initiator_rw`].
+pub async fn rekey_responder_rw<R, W>(
+    read: &mut R,
+    write: &mut W,
+    identity: &NoiseIdentity,
+) -> io::Result<ConnectionCtx>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let (noise, conn_id, params) = perform_handshake_responder_rw(read, write, identity).await?;
     Ok(ctx_from_handshake_result(noise, conn_id, params))
 }
 

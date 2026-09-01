@@ -16,10 +16,7 @@ use crate::{
         encryption::{decrypt_with_aes_gcm, encrypt_with_aes_gcm, generate_key},
         flags::{ConnectionParams, MsgType},
         header::{EOL, HEADER_LENGTH, ProtocolHeader, RecordMeta},
-        io_helpers::{read_until, read_with_std_io},
-        padding::{
-             pkcs7_validation, remove_padding_with_scheme,
-        },
+        io_helpers::{read_until, read_until_buffered, read_with_std_io},
         proto::Proto,
         status::ProtocolStatus,
     },
@@ -269,107 +266,18 @@ where
     /// single-message key is read directly out of the header (see
     /// [`Self::to_bytes`]).
     pub fn from_bytes(bytes: &[u8], conn: Option<&mut ConnectionCtx>) -> io::Result<Self> {
-        log!(LogLevel::Trace, "Starting from_bytes conversion.");
+        let (header, payload) = parse_message_bytes(bytes, conn)?;
+        Self::finish(header, &payload)
+    }
 
-        if bytes.len() < HEADER_LENGTH {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Byte array too short to contain valid header",
-            ));
-        }
-
-        let header_bytes = &bytes[..HEADER_LENGTH];
-        let payload_bytes = &bytes[HEADER_LENGTH..];
-
-        // deserialize header
-        let mut cursor = Cursor::new(header_bytes);
-        let mut version_bytes = [0u8; 2];
-        read_with_std_io(&mut cursor, &mut version_bytes)?;
-        let version = u16::from_be_bytes(version_bytes);
-
-        // version check
-        let incoming_version = Version::decode(version);
-        let current_version = Version::new(env!("CARGO_PKG_VERSION"), RELEASEINFO);
-        if !current_version.compare_versions(&incoming_version) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Out of date message recieved",
-            ));
-        }
-
-        let mut b = [0u8; 1];
-        read_with_std_io(&mut cursor, &mut b)?;
-        let flags = b[0];
-
-        let mut len_bytes = [0u8; 8];
-        read_with_std_io(&mut cursor, &mut len_bytes)?;
-        let payload_length = u64::from_be_bytes(len_bytes);
-
-        read_with_std_io(&mut cursor, &mut b)?;
-        let msg_type = b[0];
-
-        read_with_std_io(&mut cursor, &mut b)?;
-        let reserved = b[0];
-
-        read_with_std_io(&mut cursor, &mut b)?;
-        let status = b[0];
-
-        let mut origin_address = [0u8; 4];
-        read_with_std_io(&mut cursor, &mut origin_address)?;
-
-        let mut encryption_key = [0u8; 32];
-        read_with_std_io(&mut cursor, &mut encryption_key)?;
-
-        let header: ProtocolHeader = ProtocolHeader {
-            version,
-            flags,
-            payload_length,
-            msg_type,
-            reserved,
-            status,
-            origin_address,
-            encryption_key,
-        };
-
-        let mut payload = payload_bytes.to_vec();
-        let flags = header.flags();
-
-        // decrypt if necessary
-        if flags.contains(ConnectionParams::ENCRYPTED) {
-            let ctx = conn.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "missing connection context")
-            })?;
-
-            let mut plain = vec![0u8; payload.len()];
-            let len = ctx.noise.read_message(&payload, &mut plain).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("noise decrypt error: {e:?}"))
-            })?;
-            plain.truncate(len);
-            payload = plain;
-        } else {
-            // Fallback path -- see the matching branch in to_bytes. The key
-            // was carried in the clear in the header, right alongside the
-            // ciphertext it protects.
-            payload = decrypt_with_aes_gcm(&payload, &header.encryption_key)?;
-        }
-
-        // Reverse order transforms
-        if flags.contains(ConnectionParams::SIGNATURE) {
-            payload = verify_checksum(payload);
-        }
-        if flags.contains(ConnectionParams::ENCODED) {
-            payload = decode_data(&payload).unwrap();
-        }
-        if flags.contains(ConnectionParams::COMPRESSED) {
-            payload = decompress_data(&payload)?;
-        }
-
-        payload = match remove_padding_with_scheme(&payload, 16, pkcs7_validation) {
-            Ok(p) => p,
-            Err(_) => payload,
-        };
-
-        let payload: T = bincode::deserialize(&payload)
+    /// Builds a typed `Self` from a header and payload bytes already
+    /// produced by [`parse_message_bytes`]/[`read_message_raw`] -- the
+    /// final `bincode` deserialize into `T`, with no further transform
+    /// reversal. Pairs with those functions for callers (e.g. a dispatch
+    /// loop) that need to inspect [`ProtocolHeader::msg_type`] before
+    /// deciding which concrete payload type to deserialize into.
+    pub fn finish(header: ProtocolHeader, payload: &[u8]) -> io::Result<Self> {
+        let payload: T = bincode::deserialize(payload)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
 
         Ok(Self {
@@ -418,8 +326,8 @@ where
     where
         STREAM: AsyncReadExt + Unpin,
     {
-        let buffer = read_until(stream, EOL.to_vec()).await?;
-        Self::from_bytes(&buffer, conn)
+        let (header, payload) = read_message_raw(stream, conn).await?;
+        Self::finish(header, &payload)
     }
 
     /// Packs a [`ProtocolHeader`]'s fields into their fixed-width,
@@ -445,6 +353,161 @@ where
     pub fn set_msg_type(&mut self, t: MsgType) {
         self.header.set_msg_type(t);
     }
+}
+
+/// Parses a message's header and reverses every payload transform
+/// (decrypt, un-checksum, decode, decompress, un-pad) -- everything
+/// [`ProtocolMessage::from_bytes`] does *except* the final `bincode`
+/// deserialize into a concrete payload type, since that type isn't known
+/// yet at this point. Pair with [`ProtocolMessage::finish`] once
+/// [`ProtocolHeader::msg_type`] has been inspected to decide it -- this is
+/// what lets a dispatch loop (e.g. [`crate::network::driver`]) branch on a
+/// message's type before committing to a payload type. `conn` must be
+/// provided when the `ENCRYPTED` flag is set, for decryption; otherwise the
+/// single-message key is read directly out of the header (see
+/// [`ProtocolMessage::to_bytes`]).
+pub fn parse_message_bytes(
+    bytes: &[u8],
+    conn: Option<&mut ConnectionCtx>,
+) -> io::Result<(ProtocolHeader, Vec<u8>)> {
+    log!(LogLevel::Trace, "Starting parse_message_bytes conversion.");
+
+    if bytes.len() < HEADER_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Byte array too short to contain valid header",
+        ));
+    }
+
+    let header_bytes = &bytes[..HEADER_LENGTH];
+    let payload_bytes = &bytes[HEADER_LENGTH..];
+
+    // deserialize header
+    let mut cursor = Cursor::new(header_bytes);
+    let mut version_bytes = [0u8; 2];
+    read_with_std_io(&mut cursor, &mut version_bytes)?;
+    let version = u16::from_be_bytes(version_bytes);
+
+    // version check
+    let incoming_version = Version::decode(version);
+    let current_version = Version::new(env!("CARGO_PKG_VERSION"), RELEASEINFO);
+    if !current_version.compare_versions(&incoming_version) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Out of date message recieved",
+        ));
+    }
+
+    let mut b = [0u8; 1];
+    read_with_std_io(&mut cursor, &mut b)?;
+    let flags = b[0];
+
+    let mut len_bytes = [0u8; 8];
+    read_with_std_io(&mut cursor, &mut len_bytes)?;
+    let payload_length = u64::from_be_bytes(len_bytes);
+
+    read_with_std_io(&mut cursor, &mut b)?;
+    let msg_type = b[0];
+
+    read_with_std_io(&mut cursor, &mut b)?;
+    let reserved = b[0];
+
+    read_with_std_io(&mut cursor, &mut b)?;
+    let status = b[0];
+
+    let mut origin_address = [0u8; 4];
+    read_with_std_io(&mut cursor, &mut origin_address)?;
+
+    let mut encryption_key = [0u8; 32];
+    read_with_std_io(&mut cursor, &mut encryption_key)?;
+
+    let header: ProtocolHeader = ProtocolHeader {
+        version,
+        flags,
+        payload_length,
+        msg_type,
+        reserved,
+        status,
+        origin_address,
+        encryption_key,
+    };
+
+    let mut payload = payload_bytes.to_vec();
+    let flags = header.flags();
+
+    // decrypt if necessary
+    if flags.contains(ConnectionParams::ENCRYPTED) {
+        let ctx =
+            conn.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "missing connection context"))?;
+
+        let mut plain = vec![0u8; payload.len()];
+        let len = ctx.noise.read_message(&payload, &mut plain).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("noise decrypt error: {e:?}"))
+        })?;
+        plain.truncate(len);
+        payload = plain;
+    } else {
+        // Fallback path -- see the matching branch in to_bytes. The key
+        // was carried in the clear in the header, right alongside the
+        // ciphertext it protects.
+        payload = decrypt_with_aes_gcm(&payload, &header.encryption_key)?;
+    }
+
+    // Reverse order transforms
+    if flags.contains(ConnectionParams::SIGNATURE) {
+        payload = verify_checksum(payload);
+    }
+    if flags.contains(ConnectionParams::ENCODED) {
+        payload = decode_data(&payload).unwrap();
+    }
+    if flags.contains(ConnectionParams::COMPRESSED) {
+        payload = decompress_data(&payload)?;
+    }
+
+    // No padding-removal step here: `to_bytes` never applies padding (see
+    // the comment there) -- there's no `ConnectionParams` bit gating it,
+    // so a receiver can't tell "wasn't padded" from "was, and this scheme
+    // strips it" apart. Attempting it unconditionally used to silently
+    // corrupt any payload whose trailing byte(s) happened to look like
+    // valid PKCS#7 padding (e.g. a payload legitimately ending in the byte
+    // `0x01`), stripping bytes that were never padding to begin with.
+
+    Ok((header, payload))
+}
+
+/// Reads one framed message off `stream` (via
+/// [`crate::protocol::io_helpers::read_until`]) and parses it (see
+/// [`parse_message_bytes`]).
+pub async fn read_message_raw<STREAM>(
+    stream: &mut STREAM,
+    conn: Option<&mut ConnectionCtx>,
+) -> io::Result<(ProtocolHeader, Vec<u8>)>
+where
+    STREAM: AsyncReadExt + Unpin,
+{
+    let buffer = read_until(stream, EOL.to_vec()).await?;
+    parse_message_bytes(&buffer, conn)
+}
+
+/// Cancellation-safe counterpart to [`read_message_raw`], for callers that
+/// race this read against other branches in a `tokio::select!` loop --
+/// e.g. [`crate::network::driver`], which also sends and reacts to a
+/// heartbeat timer on the same task. `frame_buf` must be a buffer the
+/// caller owns across loop iterations (started empty, and left empty after
+/// this returns `Ok`); see
+/// [`crate::protocol::io_helpers::read_until_buffered`] for why a
+/// per-call-local buffer isn't safe here the way it is for
+/// [`read_message_raw`].
+pub async fn read_message_raw_buffered<STREAM>(
+    stream: &mut STREAM,
+    conn: Option<&mut ConnectionCtx>,
+    frame_buf: &mut Vec<u8>,
+) -> io::Result<(ProtocolHeader, Vec<u8>)>
+where
+    STREAM: AsyncReadExt + Unpin,
+{
+    let buffer = read_until_buffered(stream, EOL, frame_buf).await?;
+    parse_message_bytes(&buffer, conn)
 }
 
 #[cfg(test)]

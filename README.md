@@ -31,4 +31,6 @@ Rustdoc comments throughout `src/` cross-reference both documents; run
   (compression, hex-encoding, checksums, padding) applied before
   encryption.
 - `src/network/` -- async helpers that drive the protocol over a `tokio`
-  stream: establishing a connection and sending/receiving messages on it.
+  stream: establishing a connection, sending/receiving messages on it via
+  simple request/response (`send_receive`), and driving a connection
+  full-duplex in a background task (`driver`).

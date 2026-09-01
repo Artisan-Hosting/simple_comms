@@ -103,21 +103,15 @@ struct Pong {
 }
 ```
 
-**Initiator side** -- send a request and wait for a response:
+**Initiator side** -- send a request and wait for a response. `send_message`
+uses `conn.params` as this message's `ConnectionParams` (no need to pass
+them separately); use `send_message_with_params` instead if one exchange
+needs different params than the connection's established baseline:
 
 ```rust
-let outcome = send_message::<_, Ping, Pong>(
-    &mut stream,
-    ConnectionParams::ENCRYPTED,
-    Ping { seq: 1 },
-    Proto::TCP,
-    Some(&mut conn),
-)
-.await?;
-
-match outcome {
-    Ok(response) => println!("got pong: {:?}", response.payload),
-    Err(status) => eprintln!("request refused/failed: {status}"),
+match send_message::<_, Ping, Pong>(&mut stream, Ping { seq: 1 }, Proto::TCP, &mut conn).await {
+    Ok(pong) => println!("got pong: {:?}", pong),
+    Err(err) => eprintln!("request refused/failed: {err}"),
 }
 ```
 
@@ -214,6 +208,47 @@ with the *old* context) and call
 [`rekey_responder`](../src/protocol/handshake.rs) in response -- see
 [`HANDSHAKE.md`](./HANDSHAKE.md#rekey-rotating-keys-mid-connection) for the
 full sequence.
+
+## Full-duplex sessions (`ConnectionDriver`)
+
+`send_message`/`receive_message` are strict request/response: one send,
+blocked on exactly one reply. For a connection where either side should be
+able to push messages at any time -- not tied to a reply -- use
+[`ConnectionDriver`](../src/network/driver.rs) instead. It splits the
+stream and runs a background task that handles reads, writes, heartbeats,
+and rekeys for you:
+
+```rust
+use simple_comms::network::driver::{ConnectionDriver, ConnectionRole, DriverConfig, DriverMessage};
+use simple_comms::protocol::{flags::{ConnectionParams, MsgType}, message::ProtocolMessage, proto::Proto};
+
+// Initiator side (role must match how `conn` was established -- see
+// HANDSHAKE.md's `ConnectionDriver` section):
+let mut handle = ConnectionDriver::spawn::<_, Ping>(
+    stream,
+    conn,
+    ConnectionRole::Initiator { remote_static_pubkey: remote_pubkey },
+    Proto::TCP,
+    DriverConfig::default(),
+);
+
+// Push messages whenever, without waiting for a reply:
+handle.send(ProtocolMessage::new(ConnectionParams::ENCRYPTED, MsgType::Data, Ping { seq: 1 })?).await?;
+
+// Receive whatever the peer sends, whenever it arrives:
+while let Some(msg) = handle.recv().await {
+    match msg {
+        DriverMessage::Data(msg) => println!("got: {:?}", msg.payload),
+        DriverMessage::Open(req) => { /* ... */ }
+        DriverMessage::OpenAck(ack) => { /* ... */ }
+    }
+}
+```
+
+The responder side is the same shape, with
+`ConnectionRole::Responder { identity }` instead. See
+[`HANDSHAKE.md`](./HANDSHAKE.md#connectiondriver-full-duplex-sessions) for
+how heartbeats and rekeys are handled inside the driver loop.
 
 ## What's next
 

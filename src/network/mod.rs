@@ -3,5 +3,6 @@
 //! connection and sending/receiving framed [`crate::protocol::message::ProtocolMessage`]s
 //! on it.
 
+pub mod driver;
 pub mod send_receive;
 pub mod utils;

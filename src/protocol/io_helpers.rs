@@ -68,3 +68,47 @@ where
         }
     }
 }
+
+/// Cancellation-safe counterpart to [`read_until`]: identical
+/// delimiter-scanning, but progress is kept in the caller-owned `buf`
+/// rather than this function's own local state. [`read_until`] is *not*
+/// safe to use as a `tokio::select!` branch -- if the future is dropped
+/// mid-scan (because a different branch became ready first), the bytes
+/// it's already consumed from `stream` but not yet returned are gone,
+/// silently desynchronizing the framing for every message after it. Here,
+/// since `buf` lives in the caller (e.g. a `tokio::select!` loop's state,
+/// declared outside the `loop` -- see [`crate::network::driver`]) rather
+/// than in this future's own stack frame, a cancelled call leaves the
+/// bytes it already read safely in `buf` for the next call to resume
+/// from exactly where it left off. `buf` should start empty (or however a
+/// previously-cancelled call left it) and is cleared on a successful
+/// return -- the frame is returned separately, not left in `buf`.
+pub async fn read_until_buffered<T>(
+    stream: &mut T,
+    delimiter: &[u8],
+    buf: &mut Vec<u8>,
+) -> io::Result<Vec<u8>>
+where
+    T: AsyncReadExt + Unpin,
+{
+    let delimiter_len = delimiter.len();
+
+    loop {
+        if buf.len() >= delimiter_len && buf[buf.len() - delimiter_len..] == *delimiter {
+            let frame_len = buf.len() - delimiter_len;
+            let frame = buf[..frame_len].to_vec();
+            buf.clear();
+            return Ok(frame);
+        }
+
+        let mut byte = [0u8];
+        let bytes_read = stream.read(&mut byte).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Delimiter not found",
+            ));
+        }
+        buf.push(byte[0]);
+    }
+}

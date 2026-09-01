@@ -8,6 +8,7 @@
 use std::fmt;
 
 use colored::{Color, Colorize};
+use dusa_collection_utils::core::errors::{ErrorArrayItem, Errors};
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,22 @@ impl ProtocolStatus {
 
     pub fn is_waiting(&self) -> bool {
         self.contains(ProtocolStatus::WAITING)
+    }
+
+    /// Convert this status into an [`ErrorArrayItem`] describing the
+    /// failure it represents, using this status's [`Display`](fmt::Display)
+    /// output as the message. Callers are expected to have already decided
+    /// this status indicates failure (e.g. via [`Self::is_error`],
+    /// [`Self::has_flag`]) before calling this -- it doesn't itself check.
+    pub fn to_error_item(&self) -> ErrorArrayItem {
+        let kind = if self.contains(ProtocolStatus::VERSION) {
+            Errors::Protocol
+        } else if self.contains(ProtocolStatus::TIMEDOUT) {
+            Errors::ConnectionTimedOut
+        } else {
+            Errors::Protocol
+        };
+        ErrorArrayItem::new(kind, self.to_string())
     }
 
     /// A terminal color for logging/CLI display.

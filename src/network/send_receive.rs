@@ -6,6 +6,7 @@
 //! connection lifecycle these functions implement.
 
 
+use dusa_collection_utils::core::errors::{ErrorArrayItem, Errors};
 use dusa_collection_utils::core::logger::LogLevel;
 use dusa_collection_utils::{log, core::version::Version};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
@@ -51,38 +52,71 @@ where
     Ok(ctx_from_handshake_result(noise, conn_id, params))
 }
 
-/// Sends `data` as a `Data` message and waits for a single response.
+/// Wraps a transport-level [`io::Error`] (a failed read/write/parse) as an
+/// [`ErrorArrayItem`], for callers that report failures uniformly via
+/// `dusa_collection_utils`'s error types rather than raw `io::Error`.
+fn io_err_to_item(err: io::Error) -> ErrorArrayItem {
+    ErrorArrayItem::new(Errors::Network, err.to_string())
+}
+
+/// Sends `data` as a `Data` message, using `conn.params` as this message's
+/// [`ConnectionParams`], and waits for a single response.
 ///
 /// Pass `conn` (from [`establish_connection_initiator`]/
-/// [`establish_connection_responder`]) whenever `flags` includes
-/// `ConnectionParams::ENCRYPTED`. Omitting it (`None`) doesn't send the
-/// payload as plaintext -- `ProtocolMessage::to_bytes` still falls back to
-/// a single-message key -- it's just not backed by the connection's
-/// negotiated Noise session, so only do this pre-handshake or when that
-/// weaker guarantee is acceptable.
+/// [`establish_connection_responder`]) -- its `params` decide how this
+/// message is framed, and it's needed for decryption whenever `params`
+/// includes `ConnectionParams::ENCRYPTED`. Use
+/// [`send_message_with_params`] instead when a single exchange needs
+/// different params than the connection's established baseline.
 ///
 /// If the peer's response carries `ProtocolStatus::SIDEGRADE`, this retries
 /// the send once with the params the peer's `reserved` byte requested.
-/// Whether that retry is attempted is no longer a parameter here -- it's
-/// read from `conn.insecure` (declared once, at handshake time; see
-/// `docs/HANDSHAKE.md`), defaulting to `false` (no retry) when `conn` is
-/// `None`.
+/// Whether that retry is attempted is read from `conn.insecure` (declared
+/// once, at handshake time; see `docs/HANDSHAKE.md`).
+///
+/// On success, returns the response's deserialized payload directly. Any
+/// transport failure, protocol-version mismatch, refused `SIDEGRADE`, or
+/// other failure [`ProtocolStatus`] on the response is reported as a single
+/// [`ErrorArrayItem`] (transport failures via a private `io_err_to_item`
+/// helper, protocol-status failures via [`ProtocolStatus::to_error_item`]).
 pub async fn send_message<STREAM, DATA, RESPONSE>(
-    mut stream: &mut STREAM,
-    flags: ConnectionParams,
+    stream: &mut STREAM,
     data: DATA,
     proto: Proto,
-    mut conn: Option<&mut ConnectionCtx>,
-) -> Result<Result<ProtocolMessage<RESPONSE>, ProtocolStatus>, io::Error>
+    conn: &mut ConnectionCtx,
+) -> Result<RESPONSE, ErrorArrayItem>
 where
     STREAM: AsyncReadExt + AsyncWriteExt + Unpin,
     DATA: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Unpin,
     RESPONSE: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Unpin,
 {
-    let insecure = conn.as_ref().map(|c| c.insecure).unwrap_or(false);
+    let params = conn.params;
+    send_message_with_params(stream, params, data, proto, conn).await
+}
+
+/// [`send_message`], with an explicit [`ConnectionParams`] override for
+/// this one exchange instead of defaulting to `conn.params`. Mirrors
+/// [`receive_message_with_required_params`]'s relationship to
+/// [`receive_message`]. Used internally for the transparent `SIDEGRADE`
+/// retry (resending with the params the peer's `reserved` byte requested),
+/// and available to callers that need the same one-off override on the
+/// send side.
+pub async fn send_message_with_params<STREAM, DATA, RESPONSE>(
+    mut stream: &mut STREAM,
+    flags: ConnectionParams,
+    data: DATA,
+    proto: Proto,
+    conn: &mut ConnectionCtx,
+) -> Result<RESPONSE, ErrorArrayItem>
+where
+    STREAM: AsyncReadExt + AsyncWriteExt + Unpin,
+    DATA: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Unpin,
+    RESPONSE: serde::de::DeserializeOwned + std::fmt::Debug + serde::Serialize + Clone + Unpin,
+{
+    let insecure = conn.insecure;
 
     let mut message: ProtocolMessage<DATA> =
-        ProtocolMessage::new(flags, MsgType::Data, data.clone())?;
+        ProtocolMessage::new(flags, MsgType::Data, data.clone()).map_err(io_err_to_item)?;
 
     match proto {
         Proto::TCP => message.header.origin_address = get_local_ip().octets(),
@@ -92,45 +126,50 @@ where
     log!(LogLevel::Trace, "message serialized for sending");
 
     message
-        .write_to(&mut stream, proto, conn.as_deref_mut())
-        .await?;
+        .write_to(&mut stream, proto, Some(&mut *conn))
+        .await
+        .map_err(io_err_to_item)?;
     log!(LogLevel::Trace, "Message sent over {proto}");
 
-    match ProtocolMessage::<RESPONSE>::read_from(&mut stream, conn.as_deref_mut()).await {
-        Ok(response) => {
-            let response_status: ProtocolStatus = response.status();
-            let response_params: ConnectionParams =
-                ConnectionParams::from_bits_truncate(response.header.reserved);
-            let response_version: Version = Version::decode(response.header.version);
+    let response = ProtocolMessage::<RESPONSE>::read_from(&mut stream, Some(&mut *conn))
+        .await
+        .map_err(io_err_to_item)?;
 
-            let in_band = Version::compare_versions(&comms_version(), &response_version);
+    let response_status: ProtocolStatus = response.status();
+    let response_params: ConnectionParams =
+        ConnectionParams::from_bits_truncate(response.header.reserved);
+    let response_version: Version = Version::decode(response.header.version);
 
-            if !insecure && !in_band {
-                return Ok(Err(ProtocolStatus::NOTINBAND));
-            }
+    let in_band = Version::compare_versions(&comms_version(), &response_version);
 
-            if response_status.has_flag(ProtocolStatus::SIDEGRADE) {
-                log!(LogLevel::Debug, "SideGrade requested");
-                if insecure {
-                    return Box::pin(send_message::<STREAM, DATA, RESPONSE>(
-                        stream,
-                        response_params,
-                        data,
-                        proto,
-                        conn,
-                    ))
-                    .await;
-                } else {
-                    log!(LogLevel::Info, "Sidegrade not allowed dropping connections");
-                    stream.shutdown().await?;
-                    return Ok(Err(ProtocolStatus::REFUSED));
-                }
-            }
-            log!(LogLevel::Trace, "Received response: {:?}", response);
-            Ok(Ok(response))
-        }
-        Err(err) => Err(err),
+    if !insecure && !in_band {
+        return Err(ProtocolStatus::NOTINBAND.to_error_item());
     }
+
+    if response_status.has_flag(ProtocolStatus::SIDEGRADE) {
+        log!(LogLevel::Debug, "SideGrade requested");
+        if insecure {
+            return Box::pin(send_message_with_params::<STREAM, DATA, RESPONSE>(
+                stream,
+                response_params,
+                data,
+                proto,
+                conn,
+            ))
+            .await;
+        } else {
+            log!(LogLevel::Info, "Sidegrade not allowed dropping connections");
+            stream.shutdown().await.map_err(io_err_to_item)?;
+            return Err(ProtocolStatus::REFUSED.to_error_item());
+        }
+    }
+
+    if response_status.is_error() {
+        return Err(response_status.to_error_item());
+    }
+
+    log!(LogLevel::Trace, "Received response: {:?}", response);
+    Ok(response.payload)
 }
 
 /// Core of [`receive_message`]/[`receive_message_with_required_params`]:
@@ -351,12 +390,12 @@ mod tests {
         assert!(client_ctx.insecure);
         assert!(server_ctx.insecure);
 
-        let client_fut = send_message::<_, Vec<u8>, ()>(
+        let client_fut = send_message_with_params::<_, Vec<u8>, ()>(
             &mut client,
             ConnectionParams::NONE, // deliberately wrong -- doesn't match the established baseline
             b"hello".to_vec(),
             Proto::TCP,
-            Some(&mut client_ctx),
+            &mut client_ctx,
         );
         let server_fut =
             receive_message::<_, Vec<u8>>(&mut server, true, Proto::TCP, Some(&mut server_ctx));
@@ -367,8 +406,7 @@ mod tests {
         assert_eq!(received.payload, b"hello".to_vec());
         assert!(received.flags().contains(server_ctx.params));
 
-        let response = client_result.unwrap().unwrap();
-        assert!(response.status().is_ok());
+        client_result.unwrap();
     }
 
     /// Same mismatch, but the connection was *not* declared `insecure`:
@@ -380,12 +418,12 @@ mod tests {
         assert!(!client_ctx.insecure);
         assert!(!server_ctx.insecure);
 
-        let client_fut = send_message::<_, Vec<u8>, ()>(
+        let client_fut = send_message_with_params::<_, Vec<u8>, ()>(
             &mut client,
             ConnectionParams::NONE,
             b"hello".to_vec(),
             Proto::TCP,
-            Some(&mut client_ctx),
+            &mut client_ctx,
         );
         let server_fut =
             receive_message::<_, Vec<u8>>(&mut server, true, Proto::TCP, Some(&mut server_ctx));
@@ -396,8 +434,7 @@ mod tests {
         assert_eq!(received.flags(), ConnectionParams::NONE);
         assert_ne!(received.flags(), server_ctx.params);
 
-        let response = client_result.unwrap().unwrap();
-        assert!(response.status().is_ok());
+        client_result.unwrap();
     }
 
     /// Manual path: a connection established with a minimal baseline can
@@ -411,10 +448,9 @@ mod tests {
 
         let client_fut = send_message::<_, Vec<u8>, ()>(
             &mut client,
-            ConnectionParams::INSECURE, // matches the (minimal) established baseline
-            b"sensitive".to_vec(),
+            b"sensitive".to_vec(), // client_ctx.params is ConnectionParams::INSECURE
             Proto::TCP,
-            Some(&mut client_ctx),
+            &mut client_ctx,
         );
         let server_fut = receive_message_with_required_params::<_, Vec<u8>>(
             &mut server,
@@ -434,7 +470,6 @@ mod tests {
             ConnectionParams::ENCRYPTED | ConnectionParams::INSECURE
         );
 
-        let response = client_result.unwrap().unwrap();
-        assert!(response.status().is_ok());
+        client_result.unwrap();
     }
 }
